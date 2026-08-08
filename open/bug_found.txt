@@ -1,0 +1,393 @@
+Bugs Found in opencode-py
+=========================
+
+1. JSONC Parser - Nested Block Comments
+----------------------------------------
+File: opencode_py/config.py:62-64
+
+The JSONC comment stripper doesn't handle nested `/* */` comments correctly. A comment like `/* outer /* inner */ */` will exit at the first `*/`, leaving the outer comment unclosed. While rare in practice, this is a correctness bug.
+
+```python
+while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+    i += 1
+i += 2
+```
+
+2. Undo Stack - File Deletion Not Properly Tracked
+---------------------------------------------------
+File: opencode_py/agent/loop.py:206, 566-568
+
+When `write` creates a new file, the snapshot stores `None`. On undo, it calls `unlink()` if the file exists. But if the file was already deleted by another tool in the same turn, undo silently succeeds when it shouldn't revert anything. Also, the `mkdir(parents=True)` side effect from `write` has no undo counterpart - parent directories created during write are never cleaned up on undo.
+
+```python
+snapshot = p.read_bytes() if p.exists() else None  # line 206
+
+# Undo logic (lines 566-568):
+if entry["original"] is None:
+    if path.exists():
+        path.unlink()
+```
+
+3. Session File I/O - Non-Atomic Writes
+----------------------------------------
+File: opencode_py/session.py:62-66
+
+`save_session` writes directly to the session JSON file without atomic write (temp file + rename). If the process crashes mid-write or two sessions write concurrently, the file can be corrupted. `load_session` catches `JSONDecodeError` and silently returns `None`, losing the session data.
+
+```python
+def save_session(session: Session) -> Path:
+    GPath.sessions_dir().mkdir(parents=True, exist_ok=True)
+    path = session_path(session.id)
+    path.write_text(json.dumps(session.to_dict(), indent=2), encoding="utf-8")
+    return path
+```
+
+4. Config Merge - `agent` vs `agents` Key Mismatch
+---------------------------------------------------
+File: opencode_py/config.py:159-160, 222
+
+The config reads `"agent"` (singular) from JSON but stores in `cfg.agents` (plural). `as_dict()` writes back as `"agent"`. If a user writes `"agents"` in their config file (matching the dataclass field name), it's silently ignored.
+
+```python
+if "agent" in data:
+    cfg.agents = _apply_vars(data["agent"], base)  # line 159-160
+
+# as_dict() line 222:
+"agent": self.agents,
+```
+
+5. Token Estimation - Under-counts Tool Messages
+-------------------------------------------------
+File: opencode_py/agent/messages.py:50-58
+
+`_text()` only extracts `content` and `reasoning_content`. It ignores:
+- `tool_calls` in assistant messages (large JSON)
+- `tool_call_id` and `name` in tool result messages
+- Role metadata
+
+For tool-heavy conversations, `trim_history` significantly under-counts tokens, potentially exceeding the context budget and causing provider errors.
+
+```python
+def _text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    reasoning = message.get("reasoning_content", "")
+    if isinstance(content, str):
+        return content + reasoning
+    # ...
+```
+
+6. Permission Engine - Approved Patterns Never Cleaned Up
+---------------------------------------------------------
+File: opencode_py/permission.py:33, 137-139, 143-145
+
+`_approved_patterns` list grows unboundedly. In long sessions with many "always allow" approvals, this accumulates entries checked against every permission request. No TTL or cleanup mechanism.
+
+```python
+_approved_patterns: list[str] = field(default_factory=list)
+
+# Check (lines 137-139):
+for approved in self._approved_patterns:
+    if any(self.match(approved, p) or self.match(p, approved) for p in always_patterns):
+        return True
+
+# Add (lines 143-145):
+if reply == "always":
+    for p in always_patterns:
+        self._approved_patterns.append(p)
+```
+
+7. TUI `_show_error` Doesn't Reset Streaming State
+---------------------------------------------------
+File: opencode_py/tui/app.py:635-645
+
+After calling `chat.end_stream()`, the `StatusBar.streaming` state is not reset (only reset in `_turn_done`). If `_show_error` is called from the exception handler (line 628-629), the spinner continues until `_turn_done` in the `finally` block - but if `call_from_thread` itself fails, the UI stays in "streaming" state indefinitely.
+
+```python
+def _show_error(self, message: str, retryable: bool = False, session_id: str | None = None) -> None:
+    self._turn_had_error = True
+    # ...
+    chat.end_stream()  # Doesn't reset status bar
+```
+
+8. `_strip_jsonc` - Escaped Characters Inside Strings
+-----------------------------------------------------
+File: opencode_py/config.py:41-42
+
+When encountering `\` inside a string, it skips the next character. If the escaped character is `\u` (Unicode escape), the subsequent 4 hex digits are treated as regular characters. If a comment sequence appears across a `\uXXXX` boundary, it could be misparsed. Very unlikely but theoretically possible.
+
+```python
+if c == "\\" and i + 1 < n:
+    out.append(text[i + 1])
+    i += 2
+    continue
+```
+
+9. `find_instruction_files` - No Symlink Cycle Protection
+----------------------------------------------------------
+File: opencode_py/agent/system.py:166-177
+
+If the directory structure contains symlinks forming a cycle (e.g., `a/b/link -> a`), the `while True` loop walking up parents runs forever. `Path.resolve()` only resolves the starting path, not the parent traversal.
+
+```python
+d = directory.resolve()
+while True:
+    # ...
+    if d.parent == d:
+        break
+    d = d.parent
+```
+
+10. Sub-agent `_read_paths` Not Inherited
+------------------------------------------
+File: opencode_py/agent/loop.py:356
+
+Each `run_turn` resets `_read_paths = set()`. Sub-agents (spawned via `task` tool) get their own `AgentLoop` with empty `_read_paths`. The "must read before edit" guard doesn't work across sub-agent boundaries - a sub-agent can edit a file the parent read without reading it first.
+
+```python
+def run_turn(self, user_text: str) -> TurnResult:
+    result = TurnResult()
+    self._read_paths = set()  # line 356
+```
+
+---
+
+Most Impactful Bugs:
+- #3 (session corruption on crash/concurrent write)
+- #5 (token under-count causing context window overflow)
+- #7 (UI stuck in streaming state after error)
+
+==========================================
+ADDITIONAL BUGS FOUND (Deep Scan)
+==========================================
+
+11. Auth - No File Locking on Concurrent Access
+-----------------------------------------------
+File: opencode_py/auth.py:57-73
+
+The `_save()` method uses `tempfile.mkstemp` + `os.replace` for atomicity, but there's **no file locking**. If two processes call `set()` concurrently, they both read the current state, modify, and write - the second write overwrites the first. Since auth.json stores API keys, this causes silent key loss.
+
+```python
+def _save(self) -> None:
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(dir=self._file.parent, suffix=".tmp")
+    # No flock/fcntl - race condition between read and write
+    os.replace(tmp_path, self._file)
+```
+
+12. Bash Tool - Shell Injection via `command` Parameter
+-----------------------------------------------------
+File: opencode_py/tools/bash.py:80-88
+
+The `command` parameter goes directly to `Popen` with `shell=True`. If the model outputs `command: "rm -rf / && echo done"`, it executes. No validation/sanitization of the command string. While this is intentional (it's a bash tool), there's no option to run without shell.
+
+```python
+proc = subprocess.Popen(
+    command,          # user-controlled string passed directly to shell
+    shell=True,       # executes via shell
+    executable=shell,
+    # ...
+)
+```
+
+13. MCP Server - No Process Cleanup on Startup Failure
+------------------------------------------------------
+File: opencode_py/tools/mcp.py:38-60
+
+If `subprocess.Popen` succeeds but `self.call("initialize")` fails, `close()` is called. But if the server process starts and then crashes immediately (before `initialize`), the process becomes a zombie - `close()` calls `terminate()` but may not reap it properly. Also, no `wait()` with timeout in `close()`.
+
+```python
+try:
+    self.call("initialize", ...)
+except MCPError:
+    self.close()        # cleanup on init failure
+    raise
+```
+
+14. MCP Server - No Request Timeout on Individual Calls
+-------------------------------------------------------
+File: opencode_py/tools/mcp.py:105-116
+
+The `_read_line()` has a per-line timeout, but **no overall request timeout**. A hung server that sends partial lines or never responds to this specific request will block forever. The `timeout` in `__init__` only applies to reading individual lines, not the full request-response cycle.
+
+```python
+def call(self, method: str, params: dict | None = None) -> dict:
+    self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}})
+    while True:
+        msg = self._read_line()
+        if msg.get("id") != rid:
+            continue
+        # ...
+```
+
+15. Anthropic Provider - Tool Result Conversion Loses `is_error`
+---------------------------------------------------------------
+File: opencode_py/providers/anthropic.py:252-268
+
+OpenAI tool messages have `is_error` flag for failed tool calls. The conversion to Anthropic format drops this field entirely. The model won't know the tool failed.
+
+```python
+def _to_anthropic_tool_message(content: Any) -> dict[str, Any]:
+    # ...
+    if isinstance(part, dict) and part.get("type") == "tool_result":
+        blocks.append(
+            {
+                "type": "tool_result",
+                "tool_use_id": part.get("tool_call_id", ""),
+                "content": part.get("content", ""),
+                # MISSING: is_error field
+            }
+        )
+```
+
+16. Grep Tool - Regex ReDoS on Malicious Patterns
+-------------------------------------------------
+File: opencode_py/tools/grep.py:81-85
+
+Python's `re` engine is vulnerable to ReDoS (catastrophic backtracking). Patterns like `(a+)+` or `(a|a?)*` on long input can hang indefinitely. No timeout or pattern complexity limit. The `rg` fallback avoids this but if `rg` is not installed, the Python fallback is vulnerable.
+
+```python
+try:
+    regex = re.compile(pattern)
+except re.error as e:
+    return [("", 0, f"invalid regex: {e}")]
+```
+
+17. Bash Tool - Output Truncation Breaks UTF-8 Multi-byte Characters
+--------------------------------------------------------------------
+File: opencode_py/tools/bash.py:128-145
+
+Truncating at byte boundary can split a multi-byte UTF-8 character. The `decode(..., errors="ignore")` silently drops the incomplete character, but the remaining output may have garbled text at the truncation point.
+
+```python
+if raw_len > max_bytes:
+    trimmed = output.encode("utf-8", errors="replace")[:max_bytes].decode(
+        "utf-8", errors="ignore"
+    )
+```
+
+18. Config - Variable Substitution No Recursion Protection
+----------------------------------------------------------
+File: opencode_py/config.py:82-96
+
+If a file referenced via `{file:...}` contains another `{file:...}` or `{env:...}`, it won't be recursively substituted (single pass). But worse: if the file contains `{file:itself}`, it causes infinite recursion (the file reads itself). No cycle detection.
+
+```python
+def substitute_vars(text: str, base_dir: Path) -> str:
+    def repl(m: re.Match) -> str:
+        # ...
+        fpath = m.group(2)
+        p = Path(fpath).expanduser()
+        try:
+            return p.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+    return _VAR_RE.sub(repl, text)
+```
+
+19. Session - No Cleanup of Orphaned Session Files
+--------------------------------------------------
+File: opencode_py/session.py:80-89
+
+Corrupted session files are silently skipped but **never deleted**. They accumulate forever. Also no TTL/cleanup for old sessions (completed ones older than X days).
+
+```python
+def list_sessions() -> list[Session]:
+    for path in GPath.sessions_dir().glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            sessions.append(Session(data))
+        except (OSError, json.JSONDecodeError):
+            continue  # silently skips corrupted files - never deletes them
+```
+
+20. Permission Engine - `doom_loop` Detection Uses Exact String Match
+---------------------------------------------------------------------
+File: opencode_py/permission.py:102-110
+
+The check `len({c for c in recent}) == 1` requires **exact identical tuples** (permission + input_value). If the model runs `bash ls` then `bash ls -la`, it's not detected as a doom loop even though it's the same tool repeating. Should use normalized/fuzzy comparison.
+
+```python
+if permission in ("bash", "write", "edit"):
+    self._last_calls.append((permission, input_value))
+    # ...
+    recent = self._last_calls[-DOOM_LOOP_THRESHOLD:]
+    if len(recent) == DOOM_LOOP_THRESHOLD and len({c for c in recent}) == 1:
+```
+
+21. WebFetch - HTTP->HTTPS Upgrade Without Certificate Verification
+-------------------------------------------------------------------
+File: opencode_py/tools/webfetch.py:37-39
+
+HTTP URLs are silently upgraded to HTTPS, but there's **no certificate verification bypass**. If the HTTPS endpoint has a self-signed cert, it will fail. The upgrade is optimistic but may break for internal/local services. Also no option to disable upgrade.
+
+```python
+upgraded = url.startswith("http://")
+if upgraded:
+    url = "https://" + url[len("http://"):]
+```
+
+22. TUI - `expand_braces` Only Handles Single Level
+---------------------------------------------------
+File: opencode_py/tools/grep.py:16-28
+
+Only expands the **first** `{...}` group. Nested braces like `{a,{b,c}}` or multiple groups like `{a,b}{c,d}` are not handled. `rg` handles this natively but the Python fallback doesn't.
+
+```python
+def _expand_braces(pattern: str) -> list[str]:
+    if "{" not in pattern:
+        return [pattern]
+    open_idx = pattern.find("{")
+    close_idx = pattern.find("}", open_idx + 1)
+    # only handles first group
+```
+
+23. Agent Loop - Provider Factory Not Used for Main Rotation
+------------------------------------------------------------
+File: opencode_py/agent/loop.py:89-91
+
+The main rotation is built once at construction. If config changes (via `/model` command), `rebuild_rotation()` is called but uses `build_rotation` directly, not `self.provider_factory`. Sub-agents use the factory, but the main agent doesn't. Inconsistent.
+
+```python
+self.provider_factory = provider_factory or (lambda: build_rotation(cfg, auth))
+# ...
+self.rotation = provider or build_rotation(cfg, auth)
+```
+
+24. TUI - Spinner Timer Not Cleaned Up on App Exit
+--------------------------------------------------
+File: opencode_py/tui/input_bar.py:274-287
+
+If the app exits while busy (Ctrl+Q during a turn), the `_timer` is never stopped. Textual may complain about timers on dead widgets. Not critical but unclean.
+
+```python
+def set_busy(self, busy: bool, message: str = "") -> None:
+    if busy:
+        if self._timer is None:
+            self._timer = self.set_interval(0.08, self._tick_spinner)
+    else:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+# Timer not stopped in on_exit_app
+```
+
+25. OpenAI Compat Provider - `stream_options` Always Sent
+---------------------------------------------------------
+File: opencode_py/providers/openai_compat.py:94-96
+
+Some OpenAI-compatible endpoints (e.g., older versions, certain gateways) **reject** the `stream_options` field. The `include_usage` flag exists but defaults to `True` and there's no way to disable it per-provider in the config.
+
+```python
+if self.include_usage:
+    payload["stream_options"] = {"include_usage": True}
+```
+
+---
+
+Most Impactful New Bugs:
+- #11 (Auth concurrent write race - silent API key loss)
+- #12 (Bash shell injection - arbitrary command execution)
+- #13 (MCP zombie processes - resource leaks)
+- #15 (Anthropic tool error loss - model doesn't know tool failed)
+- #16 (Grep ReDoS - denial of service via regex)
+- #18 (Config file recursion - infinite loop / stack overflow)
